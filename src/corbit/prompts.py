@@ -243,7 +243,8 @@ def build_review_prompt(
 FEEDBACK_TEMPLATE = (
     "Apply the following review feedback to the code.\n"
     "You MUST address EVERY item listed below — do not skip any.\n"
-    "After making all changes, commit and push. "
+    "After making all changes, create a NEW commit (do NOT amend the previous "
+    "commit — use `git commit`, never `git commit --amend`) and push. "
     "Do NOT write a summary of what you changed — just make the fixes, "
     "commit, and push. Once pushed, you are DONE — just stop.\n\n"
     "{feedback}"
