@@ -83,6 +83,13 @@ async def _rebase_onto_base(worktree: WorktreeInfo) -> None:
     """
     cwd = str(worktree.path)
 
+    # Abort any in-progress rebase left behind by the coder agent
+    abort = await asyncio.create_subprocess_exec(
+        "git", "rebase", "--abort",
+        cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await abort.communicate()  # ignore errors — no-op if no rebase in progress
+
     # Fetch the latest base branch
     proc = await asyncio.create_subprocess_exec(
         "git", "fetch", "origin", worktree.base_branch,
@@ -262,20 +269,8 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
 
             session_id = result.session_id
 
-            # Rebase onto latest base branch before pushing/creating the PR so
-            # the branch stays mergeable even when other PRs landed on main
-            # while this worktree was being implemented (parallel or sequential
-            # runs without wait_for_merge).
-            try:
-                await _rebase_onto_base(worktree)
-            except RuntimeError as exc:
-                state.status = PipelineStatus.FAILED
-                state.error = str(exc)
-                console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                await _maybe_post_linear_comment(issue, f"❌ Pipeline failed: {state.error}", config)
-                return state
-
-            # Discover the PR the agent created
+            # Discover the PR the agent created (before rebase so we can
+            # save state and allow resumption if rebase fails).
             pr = await find_pr_for_branch(worktree.branch_name)
             if pr is None:
                 # Agent didn't create a PR — fall back to creating one ourselves
@@ -312,6 +307,17 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 f"🤖 PR created by Corbit: {pr.url}",
                 config,
             )
+
+            # Rebase onto latest base branch so the PR stays mergeable
+            # even when other PRs landed on main while being implemented.
+            try:
+                await _rebase_onto_base(worktree)
+            except RuntimeError as exc:
+                state.status = PipelineStatus.FAILED
+                state.error = str(exc)
+                console.print(f"[bold red]{issue.display_id}[/] {state.error}")
+                await _maybe_post_linear_comment(issue, f"❌ Pipeline failed: {state.error}", config)
+                return state
 
         # 3. Review loop (skip if single-pass)
         if config.iteration_mode == IterationMode.SINGLE_PASS:
