@@ -6,7 +6,7 @@ import os
 import tomllib
 from pathlib import Path
 
-from corbit.models import AgentBackend, CorbitConfig, IterationMode, MergeMethod
+from corbit.models import AgentBackend, CorbitConfig, IterationMode, MergeMethod, MergeStrategy
 
 _CONFIG_FILENAME = ".corbit.toml"
 
@@ -67,7 +67,7 @@ def load_config(
     debug: bool = False,
     merge_method: str | None = None,
     clean: bool = False,
-    wait_for_merge: bool = False,
+    merge_strategy: str | None = None,
 ) -> CorbitConfig:
     """Load config with 3-layer precedence: toml < env < CLI flags."""
     merged: dict[str, object] = {}
@@ -98,7 +98,7 @@ def load_config(
         merged["merge_method"] = MergeMethod(merge_method)
     if clean:
         merged["clean"] = True
-    if wait_for_merge:
-        merged["wait_for_merge"] = True
+    if merge_strategy is not None:
+        merged["merge_strategy"] = MergeStrategy(merge_strategy)
 
     return CorbitConfig(**merged)  # type: ignore[arg-type]

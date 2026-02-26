@@ -144,6 +144,12 @@ class MergeMethod(str, Enum):
     REBASE = "rebase"
 
 
+class MergeStrategy(str, Enum):
+    AUTO = "auto"    # corbit merges the PR automatically
+    WAIT = "wait"    # corbit polls until the user merges on GitHub
+    SKIP = "skip"    # leave PR open, do not wait (useful in parallel mode)
+
+
 class CorbitConfig(BaseModel):
     coder_backend: AgentBackend = AgentBackend.CLAUDE_CODE
     reviewer_backend: AgentBackend = AgentBackend.CLAUDE_CODE
@@ -156,9 +162,9 @@ class CorbitConfig(BaseModel):
     reviewer_model: str = ""
     debug: bool = False
     sequential: bool = True
-    merge_method: MergeMethod = MergeMethod.SQUASH
+    merge_method: MergeMethod = MergeMethod.REBASE
+    merge_strategy: MergeStrategy = MergeStrategy.WAIT
     clean: bool = False
-    wait_for_merge: bool = False
     linear_api_key: str = ""
     linear_post_comment: bool = True
     skip_permissions: bool = True

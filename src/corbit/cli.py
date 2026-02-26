@@ -18,7 +18,7 @@ from corbit import linear as linear_ops
 from corbit.caffeinate import prevent_sleep
 from corbit.config import load_config
 from corbit.epic import extract_epic_plan, is_epic
-from corbit.models import AgentBackend, CorbitConfig, GitHubIssue, Issue, IssueSource, IterationMode, LinearIssue, MergeMethod
+from corbit.models import AgentBackend, CorbitConfig, GitHubIssue, Issue, IssueSource, IterationMode, LinearIssue, MergeMethod, MergeStrategy
 from corbit.orchestrator import run_epic_plan, run_issues, run_linear_epic_plan
 from corbit.worktree import cleanup_all_worktrees, cleanup_issue_worktree
 
@@ -32,6 +32,7 @@ console = Console()
 _BACKEND_CHOICES = [b.value for b in AgentBackend]
 _MODE_CHOICES = [m.value for m in IterationMode]
 _MERGE_CHOICES = [m.value for m in MergeMethod]
+_MERGE_STRATEGY_CHOICES = [s.value for s in MergeStrategy]
 
 # Known models per backend: (model_id, description)
 _CLAUDE_MODELS: list[tuple[str, str]] = [
@@ -113,6 +114,7 @@ def _config_to_toml(cfg: CorbitConfig) -> str:
         f'merge_method = "{cfg.merge_method.value}"',
         f"linear_post_comment = {str(cfg.linear_post_comment).lower()}",
         f"skip_permissions = {str(cfg.skip_permissions).lower()}",
+        f'merge_strategy = "{cfg.merge_strategy.value}"',
     ]
     if cfg.coder_model:
         lines.append(f'coder_model = "{cfg.coder_model}"')
@@ -137,7 +139,7 @@ def run(
     debug: Annotated[bool, typer.Option("--debug", help="Step-by-step confirmation mode")] = False,
     merge_method: Annotated[Optional[str], typer.Option("--merge-method", help="Merge method (squash, merge, rebase)")] = None,
     clean: Annotated[bool, typer.Option("--clean", help="Remove existing worktrees before starting (fresh start)")] = False,
-    wait_for_merge: Annotated[bool, typer.Option("--wait-for-merge", help="After each PR is approved, wait for you to merge it on GitHub before continuing")] = False,
+    merge_strategy: Annotated[Optional[str], typer.Option("--merge-strategy", help="auto: corbit merges; wait: poll until you merge; skip: leave PR open")] = None,
 ) -> None:
     """Run the Corbit pipeline for one or more issues (GitHub or Linear)."""
     issue_refs = _parse_issue_refs(issue)
@@ -165,7 +167,7 @@ def run(
         debug=debug,
         merge_method=merge_method,
         clean=clean,
-        wait_for_merge=wait_for_merge,
+        merge_strategy=merge_strategy,
     )
 
     async def _fetch_issues() -> list[Issue]:
@@ -185,7 +187,8 @@ def run(
             issue = issues[0]
             if isinstance(issue, GitHubIssue) and is_epic(issue):
                 plan = extract_epic_plan(issue)
-                return await run_epic_plan(plan, config)
+                if plan.groups:
+                    return await run_epic_plan(plan, config)
             if isinstance(issue, LinearIssue):
                 api_key = config.linear_api_key or None
                 plan = await linear_ops.fetch_epic_plan(issue.identifier, api_key=api_key)
@@ -290,6 +293,17 @@ def config() -> None:
         default="y" if existing.linear_post_comment else "n",
     )
 
+    # Merge strategy
+    merge_strategy_str = Prompt.ask(
+        "[bold]Merge strategy[/]\n"
+        "  auto = corbit merges the PR automatically\n"
+        "  wait = corbit waits for you to merge on GitHub\n"
+        "  skip = leave PR open, do not wait\n"
+        "  Choose",
+        choices=_MERGE_STRATEGY_CHOICES,
+        default=existing.merge_strategy.value,
+    )
+
     # Build config
     cfg = CorbitConfig(
         coder_backend=AgentBackend(coder_backend),
@@ -303,6 +317,7 @@ def config() -> None:
         reviewer_model=reviewer_model,
         linear_api_key=linear_api_key,
         linear_post_comment=(linear_post_comment_str == "y"),
+        merge_strategy=MergeStrategy(merge_strategy_str),
     )
 
     # Preview
