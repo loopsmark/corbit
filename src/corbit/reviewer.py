@@ -9,10 +9,14 @@ import stat
 import tempfile
 from pathlib import Path
 
+from rich.console import Console
+
 from corbit.github import post_pr_review
 from corbit.models import AgentBackend, PullRequestInfo, ReviewItem, ReviewResult, ReviewSeverity, ReviewVerdict
 from corbit.prompts import build_review_prompt
 from corbit.stream import run_streaming
+
+_console = Console()
 
 
 def _build_no_gh_env() -> dict[str, str]:
@@ -154,13 +158,18 @@ class Reviewer:
             if sid:
                 self._session_id = sid
 
-        # Post the review to GitHub from corbit (agent can't do it)
+        # Post the review to GitHub from corbit (agent can't do it).
+        # Failures here are non-fatal — the review result is still valid
+        # and the pipeline should continue with the feedback.
         if review.verdict != ReviewVerdict.ERROR:
             if review.items:
                 body = _format_review_body(review.items)
             else:
                 body = review.comments or ("LGTM" if review.verdict == ReviewVerdict.APPROVED else "")
-            await post_pr_review(pr.number, review.verdict.value, body)
+            try:
+                await post_pr_review(pr.number, review.verdict.value, body)
+            except RuntimeError as exc:
+                _console.print(f"[yellow]Warning: failed to post review to GitHub: {exc}[/]")
 
         return review
 
