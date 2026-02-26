@@ -35,6 +35,11 @@ REVIEW_TEMPLATE = (
     "WHAT TO IGNORE:\n"
     "- Pure stylistic preferences (formatting, naming bikeshedding)\n"
     "- Hypothetical scenarios that require truly unlikely conditions\n\n"
+    "HOW TO WRITE COMMENTS:\n"
+    "Each comment must be a clear, single directive — tell the coder exactly "
+    "what to do. Do NOT present alternatives ('either X or Y'), do NOT list "
+    "options, and do NOT leave the decision to the implementer. Pick the best "
+    "fix and state it. A coder agent will apply your feedback verbatim.\n\n"
     "Report at most 7 items, prioritized by severity — bugs first.\n\n"
     "Each item MUST include a severity:\n"
     '- "bug": incorrect behavior, data loss, security vulnerability\n'
@@ -81,6 +86,11 @@ FOLLOW_UP_REVIEW_TEMPLATE = (
     "For each proposed change, examine the existing system and redesign it "
     "into the most elegant solution that would have emerged if the change "
     "had been a foundational assumption from the start.\n\n"
+    "HOW TO WRITE COMMENTS:\n"
+    "Each comment must be a clear, single directive — tell the coder exactly "
+    "what to do. Do NOT present alternatives ('either X or Y'), do NOT list "
+    "options, and do NOT leave the decision to the implementer. Pick the best "
+    "fix and state it. A coder agent will apply your feedback verbatim.\n\n"
     "Report at most 7 items, prioritized by severity — bugs first.\n\n"
     "Each item MUST include a severity:\n"
     '- "bug": incorrect behavior, data loss, security vulnerability\n'
