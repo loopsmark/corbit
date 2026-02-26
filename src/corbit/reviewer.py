@@ -53,13 +53,6 @@ _SEVERITY_HEADERS: dict[ReviewSeverity, str] = {
     ReviewSeverity.NIT: "Nits (informational)",
 }
 
-_BLOCKING_SEVERITIES: frozenset[ReviewSeverity] = frozenset({
-    ReviewSeverity.BUG,
-    ReviewSeverity.CORRECTNESS,
-    ReviewSeverity.DESIGN,
-    ReviewSeverity.TESTING,
-})
-
 
 def _format_review_body(items: list[ReviewItem]) -> str:
     """Format review items grouped by severity for posting to GitHub."""
@@ -338,24 +331,20 @@ class Reviewer:
                     severity=severity,
                 ))
 
-        # Separate blocking items from nits
-        blocking = [i for i in items if i.severity in _BLOCKING_SEVERITIES]
-        nits = [i for i in items if i.severity == ReviewSeverity.NIT]
-
-        # If the reviewer requested changes but only nits remain, treat as approved
-        if verdict == ReviewVerdict.CHANGES_REQUESTED and items and not blocking:
-            verdict = ReviewVerdict.APPROVED
-
-        # Build feedback for the coder: only blocking items
-        if blocking:
+        # Build feedback for the coder from all items
+        if items:
             comments = "\n".join(
                 f"- [{item.severity.value}] {item.file}: {item.comment}"
-                for item in blocking
+                for item in items
             )
-        elif nits:
-            comments = data.get("comments", "")
         else:
             comments = data.get("comments", "")
+
+        # Guard against inconsistent LLM output: if the verdict is
+        # "approved" but there are items, override to "changes-requested"
+        # so we never approve and simultaneously request work.
+        if verdict == ReviewVerdict.APPROVED and items:
+            verdict = ReviewVerdict.CHANGES_REQUESTED
 
         return ReviewResult(
             verdict=verdict,
