@@ -9,6 +9,9 @@ from corbit.models import GitHubIssue, IssueComment, PullRequestInfo
 
 _PR_POLL_INTERVAL = 30  # seconds between GitHub PR state checks
 
+# Cached repo slug (owner/repo) — resolved once, used by all gh commands
+_repo_slug: str | None = None
+
 
 async def _run_gh(*args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
@@ -23,18 +26,32 @@ async def _run_gh(*args: str) -> str:
     return stdout.decode().strip()
 
 
+async def _ensure_repo_slug() -> str:
+    """Resolve and cache the owner/repo slug for the current repository."""
+    global _repo_slug  # noqa: PLW0603
+    if _repo_slug is None:
+        raw = await _run_gh("repo", "view", "--json", "owner,name")
+        data = json.loads(raw)
+        _repo_slug = f"{data['owner']['login']}/{data['name']}"
+    return _repo_slug
+
+
+async def _run_gh_repo(*args: str) -> str:
+    """Run a gh command with --repo owner/repo to avoid cwd ambiguity."""
+    slug = await _ensure_repo_slug()
+    return await _run_gh(*args, "--repo", slug)
+
+
 async def get_repo_info() -> tuple[str, str]:
     """Return (owner, repo) for the current repository."""
-    raw = await _run_gh(
-        "repo", "view", "--json", "owner,name",
-    )
-    data = json.loads(raw)
-    return data["owner"]["login"], data["name"]
+    slug = await _ensure_repo_slug()
+    owner, repo = slug.split("/", 1)
+    return owner, repo
 
 
 async def fetch_issue(issue_number: int) -> GitHubIssue:
     """Fetch a GitHub issue by number, including comments."""
-    raw = await _run_gh(
+    raw = await _run_gh_repo(
         "issue", "view", str(issue_number),
         "--json", "number,title,body,labels,url,comments",
     )
@@ -63,7 +80,7 @@ async def fetch_issue(issue_number: int) -> GitHubIssue:
 async def find_pr_for_branch(branch: str) -> PullRequestInfo | None:
     """Find an open PR for the given head branch, or None."""
     try:
-        raw = await _run_gh(
+        raw = await _run_gh_repo(
             "pr", "view", branch,
             "--json", "number,url,headRefName,baseRefName",
         )
@@ -86,7 +103,7 @@ async def create_pull_request(
 ) -> PullRequestInfo:
     """Create a pull request and return its info."""
     # gh pr create returns the PR URL on stdout
-    url = await _run_gh(
+    url = await _run_gh_repo(
         "pr", "create",
         "--head", head_branch,
         "--base", base_branch,
@@ -119,27 +136,27 @@ async def post_pr_review(
     """
     if verdict == "approved":
         try:
-            await _run_gh("pr", "review", str(pr_number), "--approve", "--body", body or "LGTM")
+            await _run_gh_repo("pr", "review", str(pr_number), "--approve", "--body", body or "LGTM")
         except RuntimeError:
             # Own PR — GitHub disallows approving your own PR, post as comment
-            await _run_gh("pr", "comment", str(pr_number), "--body", f"✅ **Approved**\n\n{body}" if body else "✅ **Approved** — LGTM")
+            await _run_gh_repo("pr", "comment", str(pr_number), "--body", f"✅ **Approved**\n\n{body}" if body else "✅ **Approved** — LGTM")
         return
 
     try:
-        await _run_gh("pr", "review", str(pr_number), "--request-changes", "--body", body)
+        await _run_gh_repo("pr", "review", str(pr_number), "--request-changes", "--body", body)
     except RuntimeError:
         # Own PR — post as a regular comment instead
-        await _run_gh("pr", "comment", str(pr_number), "--body", body)
+        await _run_gh_repo("pr", "comment", str(pr_number), "--body", body)
 
 
 async def post_pr_comment(pr_number: int, body: str) -> None:
     """Post a single comment on a PR."""
-    await _run_gh("pr", "comment", str(pr_number), "--body", body)
+    await _run_gh_repo("pr", "comment", str(pr_number), "--body", body)
 
 
 async def get_pr_review_comments(pr_number: int) -> str:
     """Fetch all review comments on a PR as a formatted string."""
-    raw = await _run_gh(
+    raw = await _run_gh_repo(
         "pr", "view", str(pr_number),
         "--json", "reviews,comments",
     )
@@ -160,7 +177,7 @@ async def get_pr_review_comments(pr_number: int) -> str:
 async def find_merged_pr_for_branch(branch: str) -> PullRequestInfo | None:
     """Return PR info if a merged PR exists for the given head branch, else None."""
     try:
-        raw = await _run_gh(
+        raw = await _run_gh_repo(
             "pr", "list",
             "--head", branch,
             "--state", "merged",
@@ -184,7 +201,7 @@ async def find_merged_pr_for_branch(branch: str) -> PullRequestInfo | None:
 async def poll_pr_merged(pr_number: int) -> None:
     """Block until the PR is merged on GitHub (polls every _PR_POLL_INTERVAL seconds)."""
     while True:
-        raw = await _run_gh("pr", "view", str(pr_number), "--json", "state")
+        raw = await _run_gh_repo("pr", "view", str(pr_number), "--json", "state")
         data = json.loads(raw)
         if data["state"] == "MERGED":
             return
@@ -193,7 +210,7 @@ async def poll_pr_merged(pr_number: int) -> None:
 
 async def merge_pr(pr_number: int, method: str = "squash") -> None:
     """Merge a pull request using the given method (squash, merge, rebase)."""
-    await _run_gh(
+    await _run_gh_repo(
         "pr", "merge", str(pr_number),
         f"--{method}",
         "--delete-branch",
