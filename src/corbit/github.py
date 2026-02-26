@@ -120,9 +120,10 @@ async def post_pr_review(
     if verdict == "approved":
         try:
             await _run_gh("pr", "review", str(pr_number), "--approve", "--body", body or "LGTM")
-            return
         except RuntimeError:
-            pass
+            # Own PR — GitHub disallows approving your own PR, post as comment
+            await _run_gh("pr", "comment", str(pr_number), "--body", f"✅ **Approved**\n\n{body}" if body else "✅ **Approved** — LGTM")
+        return
 
     try:
         await _run_gh("pr", "review", str(pr_number), "--request-changes", "--body", body)
