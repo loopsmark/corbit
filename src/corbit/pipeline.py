@@ -527,6 +527,7 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
         state.status = PipelineStatus.FAILED
         state.error = "Aborted by user"
         console.print(f"[bold red]{issue.display_id}[/] Aborted by user")
+        raise
 
     except Exception as exc:
         state.status = PipelineStatus.FAILED
