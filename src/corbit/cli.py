@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from typing import Annotated, Optional
@@ -13,13 +14,16 @@ from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 
 from corbit import __version__
-from corbit import github as github_ops
 from corbit import linear as linear_ops
 from corbit.caffeinate import prevent_sleep
 from corbit.config import load_config
 from corbit.epic import extract_epic_plan, is_epic
+from corbit.issues.base import IssueProvider
+from corbit.issues.github import GitHubIssueProvider
+from corbit.issues.linear import LinearIssueProvider
 from corbit.models import AgentBackend, CorbitConfig, GitHubIssue, Issue, IssueSource, IterationMode, LinearIssue, MergeMethod, MergeStrategy
 from corbit.orchestrator import run_epic_plan, run_issues, run_linear_epic_plan
+from corbit.repo.github import GitHubRepoProvider
 from corbit.worktree import cleanup_all_worktrees, cleanup_issue_worktree
 
 app = typer.Typer(
@@ -40,21 +44,36 @@ _CLAUDE_MODELS: list[tuple[str, str]] = [
     ("claude-opus-4-6", "Opus 4.6 — most capable"),
     ("claude-haiku-4-5-20251001", "Haiku 4.5 — fastest"),
 ]
-_CODEX_MODELS: list[tuple[str, str]] = [
-    ("o4-mini", "o4-mini — fast and efficient"),
-    ("o3", "o3 — most capable"),
-    ("gpt-4o", "gpt-4o"),
-]
 
-_MODELS_BY_BACKEND: dict[str, list[tuple[str, str]]] = {
-    AgentBackend.CLAUDE_CODE.value: _CLAUDE_MODELS,
-    AgentBackend.CODEX.value: _CODEX_MODELS,
-}
+_CODEX_MODELS_CACHE = Path.home() / ".codex" / "models_cache.json"
+
+
+def _load_codex_models() -> list[tuple[str, str]]:
+    """Load available Codex models from the CLI's local cache."""
+    if not _CODEX_MODELS_CACHE.is_file():
+        return []
+    try:
+        data = json.loads(_CODEX_MODELS_CACHE.read_text())
+        return [
+            (m["slug"], f"{m['slug']} — {m.get('description', '')}")
+            for m in data.get("models", [])
+            if m.get("visibility") == "list"
+        ]
+    except (json.JSONDecodeError, KeyError):
+        return []
+
+
+def _get_models(backend: str) -> list[tuple[str, str]]:
+    if backend == AgentBackend.CLAUDE_CODE.value:
+        return _CLAUDE_MODELS
+    if backend == AgentBackend.CODEX.value:
+        return _load_codex_models()
+    return []
 
 
 def _pick_model(backend: str, current: str, label: str) -> str:
     """Show a numbered model picker for the given backend. Returns the chosen model ID."""
-    known = _MODELS_BY_BACKEND.get(backend, [])
+    known = _get_models(backend)
     options: list[tuple[str, str]] = (
         [("", "Default (let backend decide)")]
         + known
@@ -120,9 +139,6 @@ def _config_to_toml(cfg: CorbitConfig) -> str:
         lines.append(f'coder_model = "{cfg.coder_model}"')
     if cfg.reviewer_model:
         lines.append(f'reviewer_model = "{cfg.reviewer_model}"')
-    if cfg.linear_api_key:
-        lines.append("# WARNING: This key is sensitive. Prefer setting LINEAR_API_KEY as an env var instead.")
-        lines.append(f'linear_api_key = "{cfg.linear_api_key}"')
     return "\n".join(lines) + "\n"
 
 
@@ -170,31 +186,30 @@ def run(
         merge_strategy=merge_strategy,
     )
 
-    async def _fetch_issues() -> list[Issue]:
-        fetched: list[Issue] = []
-        for raw, source in issue_refs:
-            if source == IssueSource.GITHUB:
-                fetched.append(await github_ops.fetch_issue(int(raw)))
-            else:
-                fetched.append(
-                    await linear_ops.fetch_issue(raw, api_key=config.linear_api_key or None)
-                )
-        return fetched
-
     async def _run() -> list:
-        issues = await _fetch_issues()
+        issue_source = issue_refs[0][1]
+        repo = GitHubRepoProvider()
+        issue_prov: IssueProvider
+        if issue_source == IssueSource.LINEAR:
+            issue_prov = LinearIssueProvider()
+        else:
+            issue_prov = GitHubIssueProvider()
+
+        issues: list[Issue] = [
+            await issue_prov.fetch_issue(raw) for raw, _ in issue_refs
+        ]
+
         if len(issues) == 1:
             issue = issues[0]
             if isinstance(issue, GitHubIssue) and is_epic(issue):
                 plan = extract_epic_plan(issue)
                 if plan.groups:
-                    return await run_epic_plan(plan, config)
+                    return await run_epic_plan(plan, config, repo, issue_prov)
             if isinstance(issue, LinearIssue):
-                api_key = config.linear_api_key or None
-                plan = await linear_ops.fetch_epic_plan(issue.identifier, api_key=api_key)
+                plan = await linear_ops.fetch_epic_plan(issue.identifier)
                 if plan.groups:
-                    return await run_linear_epic_plan(plan, config)
-        return await run_issues(issues, config)
+                    return await run_linear_epic_plan(plan, config, repo, issue_prov)
+        return await run_issues(issues, config, repo, issue_prov)
 
     try:
         with prevent_sleep():
@@ -281,12 +296,6 @@ def config() -> None:
 
     # Linear integration
     console.print()
-    console.print("[dim]Optional: Linear integration (leave API key blank to skip)[/]")
-    linear_api_key = Prompt.ask(
-        "[bold]Linear API key[/] (or set LINEAR_API_KEY env var)",
-        default=existing.linear_api_key or "",
-        password=True,
-    )
     linear_post_comment_str = Prompt.ask(
         "[bold]Post progress comments on Linear issues?[/]",
         choices=["y", "n"],
@@ -315,7 +324,6 @@ def config() -> None:
         agent_timeout=timeout,
         coder_model=coder_model,
         reviewer_model=reviewer_model,
-        linear_api_key=linear_api_key,
         linear_post_comment=(linear_post_comment_str == "y"),
         merge_strategy=MergeStrategy(merge_strategy_str),
     )

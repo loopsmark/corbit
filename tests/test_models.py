@@ -164,7 +164,7 @@ def test_review_severity_enum() -> None:
 
 
 def test_enums() -> None:
-    assert AgentBackend("claude-code") == AgentBackend.CLAUDE_CODE
+    assert AgentBackend("claude") == AgentBackend.CLAUDE_CODE
     assert AgentBackend("codex") == AgentBackend.CODEX
     assert IterationMode("full") == IterationMode.FULL
     assert IterationMode("single-pass") == IterationMode.SINGLE_PASS

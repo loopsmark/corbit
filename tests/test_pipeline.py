@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import json
 import os
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from corbit.config import load_config
 from corbit.models import AgentBackend, CorbitConfig, IterationMode
 from corbit.models import ReviewItem, ReviewSeverity, ReviewVerdict
+from corbit.repo.base import RepoProvider
 from corbit.reviewer import Reviewer, _format_review_body
+
+
+def _mock_repo() -> RepoProvider:
+    """Create a mock RepoProvider for testing."""
+    return AsyncMock(spec=RepoProvider)
 
 
 def test_load_config_defaults() -> None:
@@ -38,7 +44,7 @@ def test_load_config_cli_overrides() -> None:
 
 def test_load_config_mixed_backends() -> None:
     with patch("corbit.config._find_config_file", return_value=None):
-        config = load_config(backend="codex", reviewer_backend="claude-code")
+        config = load_config(backend="codex", reviewer_backend="claude")
     assert config.coder_backend == AgentBackend.CODEX
     assert config.reviewer_backend == AgentBackend.CLAUDE_CODE
 
@@ -60,14 +66,14 @@ def test_load_config_env_overrides() -> None:
 
 
 def test_reviewer_parse_approved() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     result = reviewer._parse_review('{"verdict": "approved", "comments": "LGTM"}')
     assert result.verdict.value == "approved"
     assert result.comments == "LGTM"
 
 
 def test_reviewer_parse_changes_requested() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     result = reviewer._parse_review(
         '{"verdict": "changes-requested", "comments": "Fix types"}'
     )
@@ -75,20 +81,20 @@ def test_reviewer_parse_changes_requested() -> None:
 
 
 def test_reviewer_parse_wrapped_json() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     outer = '{"result": "{\\"verdict\\": \\"approved\\", \\"comments\\": \\"ok\\"}"}'
     result = reviewer._parse_review(outer)
     assert result.verdict.value == "approved"
 
 
 def test_reviewer_parse_invalid() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     result = reviewer._parse_review("not json at all")
     assert result.verdict.value == "error"
 
 
 def test_reviewer_codex_backend_args() -> None:
-    reviewer = Reviewer(backend=AgentBackend.CODEX)
+    reviewer = Reviewer(repo=_mock_repo(), backend=AgentBackend.CODEX)
     args = reviewer._build_args("test prompt")
     assert args[0] == "codex"
     assert "--full-auto" in args
@@ -96,7 +102,7 @@ def test_reviewer_codex_backend_args() -> None:
 
 
 def test_reviewer_claude_backend_args() -> None:
-    reviewer = Reviewer(backend=AgentBackend.CLAUDE_CODE, model="opus")
+    reviewer = Reviewer(repo=_mock_repo(), backend=AgentBackend.CLAUDE_CODE, model="opus")
     args = reviewer._build_args("test prompt")
     assert args[0] == "claude"
     assert "--model" in args
@@ -104,7 +110,7 @@ def test_reviewer_claude_backend_args() -> None:
 
 
 def test_reviewer_parse_severity() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     raw = (
         '{"verdict": "changes-requested", "items": ['
         '{"file": "a.py", "severity": "bug", "comment": "crash"},'
@@ -123,14 +129,14 @@ def test_reviewer_parse_severity() -> None:
 
 def test_reviewer_parse_severity_fallback() -> None:
     """Items without severity default to correctness."""
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     raw = '{"verdict": "changes-requested", "items": [{"file": "a.py", "comment": "fix"}]}'
     result = reviewer._parse_review(raw)
     assert result.items[0].severity == ReviewSeverity.CORRECTNESS
 
 
 def test_reviewer_nits_only_treated_as_approved() -> None:
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     raw = (
         '{"verdict": "changes-requested", "items": ['
         '{"file": "a.py", "severity": "nit", "comment": "rename"}'
@@ -143,7 +149,7 @@ def test_reviewer_nits_only_treated_as_approved() -> None:
 
 def test_reviewer_parse_design_severity_is_blocking() -> None:
     """Design items should block approval, not be treated as nits."""
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     raw = (
         '{"verdict": "changes-requested", "items": ['
         '{"file": "a.py", "severity": "design", "comment": "bolted-on pattern"}'
@@ -156,7 +162,7 @@ def test_reviewer_parse_design_severity_is_blocking() -> None:
 
 def test_reviewer_parse_testing_severity_is_blocking() -> None:
     """Testing items should block approval, not be treated as nits."""
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     raw = (
         '{"verdict": "changes-requested", "items": ['
         '{"file": "a.py", "severity": "testing", "comment": "missing unit tests"}'
@@ -184,7 +190,7 @@ def test_reviewer_parse_json_in_assistant_event() -> None:
     result_event = json.dumps({"type": "result", "result": "", "session_id": "s1"})
     raw = "\n".join([assistant_event, result_event]) + "\n"
 
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     result = reviewer._parse_review(raw)
     assert result.verdict == ReviewVerdict.CHANGES_REQUESTED
     assert len(result.items) == 1
@@ -206,7 +212,7 @@ def test_reviewer_parse_json_with_embedded_newlines() -> None:
     result_event = json.dumps({"type": "result", "result": reviewer_json, "session_id": "s2"})
     raw = "\n".join([assistant_event, result_event]) + "\n"
 
-    reviewer = Reviewer()
+    reviewer = Reviewer(repo=_mock_repo())
     result = reviewer._parse_review(raw)
     assert result.verdict == ReviewVerdict.CHANGES_REQUESTED
     assert "line one" in result.items[0].comment

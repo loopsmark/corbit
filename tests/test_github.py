@@ -7,7 +7,14 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+import corbit.github
 from corbit.github import fetch_issue, get_repo_info
+
+
+@pytest.fixture(autouse=True)
+def _reset_repo_slug_cache() -> None:
+    """Reset the cached repo slug between tests."""
+    corbit.github._repo_slug = None
 
 
 @pytest.mark.asyncio
@@ -48,7 +55,10 @@ async def test_fetch_issue() -> None:
     async def mock_communicate() -> tuple[bytes, bytes]:
         nonlocal call_count
         call_count += 1
-        if call_count == 1:
+        # Call 1: _ensure_repo_slug → repo view
+        # Call 2: fetch_issue → issue view
+        # Call 3: get_repo_info → repo view (uses cached slug)
+        if call_count == 2:
             return json.dumps(issue_data).encode(), b""
         return json.dumps(repo_data).encode(), b""
 

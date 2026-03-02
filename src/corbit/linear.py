@@ -18,7 +18,7 @@ def _get_api_key(api_key: str | None) -> str:
     if not key:
         raise RuntimeError(
             "LINEAR_API_KEY is not set. "
-            "Set it via the LINEAR_API_KEY environment variable or linear_api_key in .corbit.toml."
+            "Set it via the LINEAR_API_KEY environment variable."
         )
     return key
 
@@ -151,6 +151,30 @@ def _topological_groups(deps: dict[str, list[str]]) -> list[list[str]]:
             in_degree[m] -= sum(1 for d in deps[m] if d in ready)
 
     return groups
+
+
+async def fetch_comments(identifier: str, api_key: str | None = None) -> list[IssueComment]:
+    """Fetch comments for a Linear issue by its identifier (e.g. 'ENG-123')."""
+    key = _get_api_key(api_key)
+    query = """
+    query FetchComments($identifier: String!) {
+      issue(id: $identifier) {
+        comments { nodes { user { name } body } }
+      }
+    }
+    """
+    data = await _graphql(query, {"identifier": identifier}, key)
+    issue_data = data.get("issue")
+    if issue_data is None:
+        raise RuntimeError(f"Linear issue not found: {identifier}")
+
+    return [
+        IssueComment(
+            author=c["user"]["name"] if c.get("user") else "unknown",
+            body=c["body"],
+        )
+        for c in issue_data["comments"]["nodes"]
+    ]
 
 
 async def post_comment(identifier: str, body: str, api_key: str | None = None) -> None:

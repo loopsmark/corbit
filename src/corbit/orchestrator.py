@@ -7,11 +7,10 @@ import asyncio
 from rich.console import Console
 from rich.table import Table
 
-from corbit import github as github_ops
-from corbit import linear as linear_ops
-from corbit.github import find_merged_pr_for_branch, merge_pr, poll_pr_merged
+from corbit.issues.base import IssueProvider
 from corbit.models import CorbitConfig, EpicPlan, Issue, LinearEpicPlan, MergeStrategy, PipelineState, PipelineStatus
 from corbit.pipeline import run_pipeline
+from corbit.repo.base import RepoProvider
 from corbit.worktree import cleanup_issue_worktree
 
 console = Console()
@@ -20,11 +19,13 @@ console = Console()
 async def run_issues(
     issues: list[Issue],
     config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
 ) -> list[PipelineState]:
     """Run pipelines for multiple issues (parallel or sequential)."""
     if config.sequential:
-        return await _run_sequential(issues, config)
-    return await _run_parallel(issues, config)
+        return await _run_sequential(issues, config, repo, issue_provider)
+    return await _run_parallel(issues, config, repo, issue_provider)
 
 
 async def _clean_worktrees(issue_slugs: list[str]) -> None:
@@ -38,6 +39,8 @@ async def _clean_worktrees(issue_slugs: list[str]) -> None:
 async def _run_sequential(
     issues: list[Issue],
     config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
 ) -> list[PipelineState]:
     """Process issues one-by-one: implement → review → merge → pull main → next."""
     if config.clean:
@@ -57,31 +60,31 @@ async def _run_sequential(
             f"[bold cyan]{'─' * 60}[/]"
         )
 
-        state = await run_pipeline(issue, config)
+        state = await run_pipeline(issue, config, repo, issue_provider)
         states.append(state)
 
-        if state.status != PipelineStatus.APPROVED:
+        if state.status not in (PipelineStatus.APPROVED, PipelineStatus.MERGED):
             console.print(
                 f"[bold red]{issue.display_id}[/] Not approved — skipping merge, "
                 f"continuing to next issue"
             )
             continue
 
-        await _merge_step(state, config)
+        await _merge_step(state, config, repo)
 
     _print_summary(states)
     return states
 
 
-async def _already_merged(issue_slug: str) -> PipelineState | None:
+async def _already_merged(issue_slug: str, repo: RepoProvider) -> PipelineState | None:
     """Return a synthetic MERGED state if a corbit PR for this issue is already merged."""
-    pr = await find_merged_pr_for_branch(f"corbit/issue-{issue_slug}")
+    pr = await repo.find_merged_pr_for_branch(f"corbit/issue-{issue_slug}")
     if pr is None:
         return None
     return PipelineState(issue_slug=issue_slug, status=PipelineStatus.MERGED, pr=pr)
 
 
-async def _merge_step(state: PipelineState, config: CorbitConfig) -> bool:
+async def _merge_step(state: PipelineState, config: CorbitConfig, repo: RepoProvider) -> bool:
     """Handle the merge phase for a single approved PR.
 
     Returns True if the PR ended up merged (so caller can update main).
@@ -98,21 +101,26 @@ async def _merge_step(state: PipelineState, config: CorbitConfig) -> bool:
             f"merging automatically ({config.merge_method.value})..."
         )
         try:
-            await merge_pr(state.pr.number, config.merge_method.value)
+            await repo.merge_pr(state.pr.number, config.merge_method.value)
         except asyncio.CancelledError as exc:
             raise KeyboardInterrupt("Aborted by user") from exc
     else:  # WAIT
-        console.print(
-            f"\n[bold yellow]{state.issue_slug}[/] PR #{state.pr.number} approved — "
-            f"please merge it on GitHub to continue:\n  {state.pr.url}\n"
-        )
-        console.print(f"[dim]Polling every 30s until PR #{state.pr.number} is merged...[/]")
-        try:
-            await poll_pr_merged(state.pr.number)
-        except asyncio.CancelledError as exc:
-            raise KeyboardInterrupt("Aborted by user") from exc
+        if state.status == PipelineStatus.MERGED:
+            # Already handled by pipeline's _wait_and_react
+            pass
+        else:
+            console.print(
+                f"\n[bold yellow]{state.issue_slug}[/] PR #{state.pr.number} approved — "
+                f"please merge it on GitHub to continue:\n  {state.pr.url}\n"
+            )
+            console.print(f"[dim]Polling every 30s until PR #{state.pr.number} is merged...[/]")
+            try:
+                await repo.poll_pr_merged(state.pr.number)
+            except asyncio.CancelledError as exc:
+                raise KeyboardInterrupt("Aborted by user") from exc
 
-    state.status = PipelineStatus.MERGED
+    if state.status != PipelineStatus.MERGED:
+        state.status = PipelineStatus.MERGED
     console.print(f"[bold green]{state.issue_slug}[/] PR merged — continuing.")
     await _update_main(config.main_branch)
     return True
@@ -143,6 +151,8 @@ async def _update_main(main_branch: str) -> None:
 async def _run_parallel(
     issues: list[Issue],
     config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
 ) -> list[PipelineState]:
     """Run pipelines for multiple issues with bounded parallelism."""
     if config.clean:
@@ -152,7 +162,7 @@ async def _run_parallel(
 
     async def _guarded(issue: Issue) -> PipelineState:
         async with semaphore:
-            return await run_pipeline(issue, config)
+            return await run_pipeline(issue, config, repo, issue_provider)
 
     console.print(
         f"[bold]Processing {len(issues)} issue(s) "
@@ -198,7 +208,12 @@ async def _run_parallel(
     return states
 
 
-async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[PipelineState]:
+async def run_epic_plan(
+    epic_plan: EpicPlan,
+    config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
+) -> list[PipelineState]:
     """Execute an epic plan: sequential groups, parallel within each group."""
     total_issues = sum(len(g) for g in epic_plan.groups)
     console.print(
@@ -227,7 +242,7 @@ async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[Pipel
         skipped: list[PipelineState] = []
         pending_numbers: list[int] = []
         for issue_number in group:
-            cached = await _already_merged(str(issue_number))
+            cached = await _already_merged(str(issue_number), repo)
             if cached is not None:
                 console.print(f"[dim]#{issue_number} already merged — skipping.[/]")
                 skipped.append(cached)
@@ -240,14 +255,14 @@ async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[Pipel
             continue
 
         # Fetch GitHub issues for pending items (epic is GitHub-only)
-        pending_issues = [
-            await github_ops.fetch_issue(n) for n in pending_numbers
+        pending_issues: list[Issue] = [
+            await issue_provider.fetch_issue(str(n)) for n in pending_numbers
         ]
 
         if len(pending_issues) == 1:
-            run_states = [await run_pipeline(pending_issues[0], config)]
+            run_states = [await run_pipeline(pending_issues[0], config, repo, issue_provider)]
         else:
-            run_states = await _run_parallel(pending_issues, config)
+            run_states = await _run_parallel(pending_issues, config, repo, issue_provider)
 
         group_states = skipped + run_states
         all_states.extend(group_states)
@@ -255,7 +270,7 @@ async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[Pipel
         # Handle merges one at a time (no-op when merge_strategy is skip).
         for state in group_states:
             if state.status == PipelineStatus.APPROVED:
-                await _merge_step(state, config)
+                await _merge_step(state, config, repo)
 
         # Stop if anything in this group failed (implementation or merge).
         # When merge_strategy is skip, APPROVED counts as success so the epic
@@ -274,7 +289,7 @@ async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[Pipel
     success_statuses = {PipelineStatus.MERGED, PipelineStatus.APPROVED}
     all_children_ok = all(s.status in success_statuses for s in all_states)
     if all_children_ok:
-        parent_merged = await _already_merged(str(epic_plan.parent_issue))
+        parent_merged = await _already_merged(str(epic_plan.parent_issue), repo)
         if parent_merged is not None:
             console.print(f"[dim]Parent #{epic_plan.parent_issue} already merged — skipping.[/]")
             all_states.append(parent_merged)
@@ -284,17 +299,22 @@ async def run_epic_plan(epic_plan: EpicPlan, config: CorbitConfig) -> list[Pipel
                 f"[bold cyan]Parent epic #{epic_plan.parent_issue}[/]\n"
                 f"[bold cyan]{'─' * 60}[/]"
             )
-            parent_issue = await github_ops.fetch_issue(epic_plan.parent_issue)
-            parent_state = await run_pipeline(parent_issue, config)
+            parent_issue = await issue_provider.fetch_issue(str(epic_plan.parent_issue))
+            parent_state = await run_pipeline(parent_issue, config, repo, issue_provider)
             if parent_state.status == PipelineStatus.APPROVED:
-                await _merge_step(parent_state, config)
+                await _merge_step(parent_state, config, repo)
             all_states.append(parent_state)
 
     _print_summary(all_states)
     return all_states
 
 
-async def run_linear_epic_plan(epic_plan: LinearEpicPlan, config: CorbitConfig) -> list[PipelineState]:
+async def run_linear_epic_plan(
+    epic_plan: LinearEpicPlan,
+    config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
+) -> list[PipelineState]:
     """Execute a Linear epic plan: sequential groups, parallel within each group."""
     total_issues = sum(len(g) for g in epic_plan.groups)
     console.print(
@@ -322,7 +342,7 @@ async def run_linear_epic_plan(epic_plan: LinearEpicPlan, config: CorbitConfig) 
         skipped: list[PipelineState] = []
         pending_identifiers: list[str] = []
         for identifier in group:
-            cached = await _already_merged(identifier)
+            cached = await _already_merged(identifier, repo)
             if cached is not None:
                 console.print(f"[dim]{identifier} already merged — skipping.[/]")
                 skipped.append(cached)
@@ -334,23 +354,22 @@ async def run_linear_epic_plan(epic_plan: LinearEpicPlan, config: CorbitConfig) 
             all_states.extend(skipped)
             continue
 
-        api_key = config.linear_api_key or None
-        pending_issues = [
-            await linear_ops.fetch_issue(ident, api_key=api_key)
+        pending_issues: list[Issue] = [
+            await issue_provider.fetch_issue(ident)
             for ident in pending_identifiers
         ]
 
         if len(pending_issues) == 1:
-            run_states = [await run_pipeline(pending_issues[0], config)]
+            run_states = [await run_pipeline(pending_issues[0], config, repo, issue_provider)]
         else:
-            run_states = await _run_parallel(pending_issues, config)
+            run_states = await _run_parallel(pending_issues, config, repo, issue_provider)
 
         group_states = skipped + run_states
         all_states.extend(group_states)
 
         for state in group_states:
             if state.status == PipelineStatus.APPROVED:
-                await _merge_step(state, config)
+                await _merge_step(state, config, repo)
 
         success_statuses = {PipelineStatus.MERGED, PipelineStatus.APPROVED}
         failed = [s for s in group_states if s.status not in success_statuses]
@@ -366,7 +385,7 @@ async def run_linear_epic_plan(epic_plan: LinearEpicPlan, config: CorbitConfig) 
     success_statuses = {PipelineStatus.MERGED, PipelineStatus.APPROVED}
     all_children_ok = all(s.status in success_statuses for s in all_states)
     if all_children_ok:
-        parent_merged = await _already_merged(epic_plan.parent_identifier)
+        parent_merged = await _already_merged(epic_plan.parent_identifier, repo)
         if parent_merged is not None:
             console.print(f"[dim]Parent {epic_plan.parent_identifier} already merged — skipping.[/]")
             all_states.append(parent_merged)
@@ -376,11 +395,10 @@ async def run_linear_epic_plan(epic_plan: LinearEpicPlan, config: CorbitConfig) 
                 f"[bold cyan]Parent epic {epic_plan.parent_identifier}[/]\n"
                 f"[bold cyan]{'─' * 60}[/]"
             )
-            api_key = config.linear_api_key or None
-            parent_issue = await linear_ops.fetch_issue(epic_plan.parent_identifier, api_key=api_key)
-            parent_state = await run_pipeline(parent_issue, config)
+            parent_issue = await issue_provider.fetch_issue(epic_plan.parent_identifier)
+            parent_state = await run_pipeline(parent_issue, config, repo, issue_provider)
             if parent_state.status == PipelineStatus.APPROVED:
-                await _merge_step(parent_state, config)
+                await _merge_step(parent_state, config, repo)
             all_states.append(parent_state)
 
     _print_summary(all_states)

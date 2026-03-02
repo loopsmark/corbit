@@ -22,7 +22,6 @@ _ENV_MAP: dict[str, str] = {
     "CORBIT_AGENT_TIMEOUT": "agent_timeout",
     "CORBIT_CODER_MODEL": "coder_model",
     "CORBIT_REVIEWER_MODEL": "reviewer_model",
-    "LINEAR_API_KEY": "linear_api_key",
 }
 
 _INT_FIELDS = {"max_review_rounds", "parallel_workers", "agent_timeout"}
@@ -100,5 +99,13 @@ def load_config(
         merged["clean"] = True
     if merge_strategy is not None:
         merged["merge_strategy"] = MergeStrategy(merge_strategy)
+
+    # Backward compat: accept old "claude-code" value
+    for key in ("coder_backend", "reviewer_backend"):
+        if merged.get(key) == "claude-code":
+            merged[key] = "claude"
+
+    # Backward compat: ignore linear_api_key from old config files
+    merged.pop("linear_api_key", None)
 
     return CorbitConfig(**merged)  # type: ignore[arg-type]

@@ -63,15 +63,14 @@ Run `corbit config` to generate a `.corbit.toml` in your repo root. CLI flags ov
 
 | Setting | Default | Description |
 |---|---|---|
-| `coder_backend` | `claude-code` | Agent that implements issues (`claude-code` or `codex`) |
-| `reviewer_backend` | `claude-code` | Agent that reviews PRs (`claude-code` or `codex`) |
+| `coder_backend` | `claude` | Agent that implements issues (`claude` or `codex`) |
+| `reviewer_backend` | `claude` | Agent that reviews PRs (`claude` or `codex`) |
 | `max_review_rounds` | `4` | Review/fix cycles before giving up |
 | `iteration_mode` | `full` | `full` (review loop) or `single-pass` (skip review) |
 | `sequential` | `true` | Process issues one at a time (set to `false` for parallel mode) |
 | `parallel_workers` | `2` | Worker count when running in parallel mode |
 | `main_branch` | `main` | Base branch for worktrees and PRs |
 | `agent_timeout` | `600` | Seconds per agent invocation |
-| `linear_api_key` | — | Linear API key (prefer `LINEAR_API_KEY` env var to avoid committing secrets) |
 | `linear_post_comment` | `true` | Post progress comments on Linear issues |
 | `skip_permissions` | `true` | Pass `--dangerously-skip-permissions` to Claude Code (see security note below) |
 
@@ -79,7 +78,7 @@ Run `corbit config` to generate a `.corbit.toml` in your repo root. CLI flags ov
 
 ## Linear Integration
 
-Set `LINEAR_API_KEY` in your environment (or `linear_api_key` in `.corbit.toml`), then pass a Linear ID:
+Set `LINEAR_API_KEY` in your environment, then pass a Linear ID:
 
 ```bash
 export LINEAR_API_KEY=lin_api_...
@@ -105,6 +104,8 @@ corbit run --issue 42,43,44 --wait-for-merge
 ```
 
 With `--wait-for-merge`, corbit pauses after each PR is approved, prints the PR URL, and waits for you to merge it on GitHub. Once merged, it pulls the updated `main` and branches the next issue from it.
+
+While waiting, corbit also watches for **new comments** on the PR. If you leave a comment requesting changes, corbit automatically picks it up, re-runs the coder to address your feedback, and re-runs the reviewer — then resumes waiting for merge.
 
 ## Epic Issues (GitHub)
 

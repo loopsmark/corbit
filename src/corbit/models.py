@@ -14,7 +14,7 @@ class IterationMode(str, Enum):
 
 
 class AgentBackend(str, Enum):
-    CLAUDE_CODE = "claude-code"
+    CLAUDE_CODE = "claude"
     CODEX = "codex"
 
 
@@ -165,7 +165,6 @@ class CorbitConfig(BaseModel):
     merge_method: MergeMethod = MergeMethod.REBASE
     merge_strategy: MergeStrategy = MergeStrategy.WAIT
     clean: bool = False
-    linear_api_key: str = ""
     linear_post_comment: bool = True
     skip_permissions: bool = True
 

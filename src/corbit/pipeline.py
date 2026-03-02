@@ -9,21 +9,23 @@ from pathlib import Path
 from rich.console import Console
 from rich.panel import Panel
 
-from corbit import linear as linear_ops
+from corbit.agents.base import CoderAgent
 from corbit.agents.registry import get_agent
-from corbit.github import create_pull_request, find_pr_for_branch, push_branch
+from corbit.issues.base import IssueProvider
 from corbit.models import (
     CorbitConfig,
     Issue,
     IssueSource,
     IterationMode,
-    LinearIssue,
+    MergeStrategy,
     PipelineState,
     PipelineStatus,
+    PullRequestInfo,
     ReviewVerdict,
     WorktreeInfo,
 )
 from corbit.prompts import CoderContext, build_coder_prompt
+from corbit.repo.base import PrPollResult, RepoProvider
 from corbit.reviewer import Reviewer
 from corbit.worktree import create_worktree, remove_worktree
 
@@ -155,29 +157,213 @@ async def _debug_checkpoint(config: CorbitConfig, step: str, detail: str = "") -
         raise KeyboardInterrupt("Aborted by user in debug mode")
 
 
-async def _maybe_post_linear_comment(
+async def _maybe_post_issue_comment(
     issue: Issue,
     body: str,
     config: CorbitConfig,
+    issue_provider: IssueProvider,
 ) -> None:
-    """Fire-and-forget comment on a Linear issue. Never blocks the pipeline."""
-    if not isinstance(issue, LinearIssue) or not config.linear_post_comment:
+    """Fire-and-forget comment on an issue. Never blocks the pipeline."""
+    if not config.linear_post_comment:
         return
     try:
-        await linear_ops.post_comment(
-            issue.identifier,
-            body,
-            api_key=config.linear_api_key or None,
-        )
+        await issue_provider.post_comment(issue.slug, body)
     except Exception as exc:
-        console.print(f"[yellow]Warning: Linear comment failed: {exc}[/]")
+        console.print(f"[yellow]Warning: issue comment failed: {exc}[/]")
 
 
-async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
+_POLL_INTERVAL = 30  # seconds between checks during wait phase
+
+
+async def _poll_for_event(
+    pr_number: int,
+    initial_pr_count: int,
+    initial_issue_comment_count: int,
+    issue: Issue,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
+) -> tuple[PrPollResult, str]:
+    """Poll both the PR and the issue source for events.
+
+    Checks every ``_POLL_INTERVAL`` seconds until the PR is merged or a new
+    comment appears on either the PR or the issue.
+    """
+    while True:
+        await asyncio.sleep(_POLL_INTERVAL)
+
+        # Check PR for merge or new comments
+        pr_event = await repo.check_pr_for_event(pr_number, initial_pr_count)
+        if pr_event is not None:
+            return pr_event
+
+        # Check issue source for new comments
+        try:
+            current_comments = await issue_provider.fetch_comments(issue.slug)
+        except Exception:
+            # Non-fatal — if the issue source is unreachable, keep polling PR
+            continue
+
+        if len(current_comments) > initial_issue_comment_count:
+            latest_body = current_comments[-1].body.strip()
+            if latest_body:
+                return PrPollResult.USER_COMMENT, latest_body
+
+
+async def _wait_and_react(
+    state: PipelineState,
+    issue: Issue,
+    config: CorbitConfig,
+    agent: CoderAgent,
+    reviewer: Reviewer,
+    pr: PullRequestInfo,
+    worktree: WorktreeInfo,
+    agent_label: str,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
+) -> PipelineState:
+    """Wait for the PR to be merged or react to user comments.
+
+    When a user comments on the PR or the issue, re-runs the coder (fresh
+    context) to address the comment, then re-runs the reviewer (keeping its
+    accumulated session context) for up to max_review_rounds.  Resumes
+    polling after each cycle.
+    """
+    console.print(
+        f"[bold yellow]{issue.display_id}[/] Waiting for merge or user comments on PR/issue...\n"
+        f"  {pr.url}\n"
+    )
+    console.print(f"[dim]Polling every {_POLL_INTERVAL}s until PR #{pr.number} is merged or commented...[/]")
+
+    # Snapshot current interaction counts so we only react to *new* comments
+    initial_pr_count = await repo.count_pr_interactions(pr.number)
+    try:
+        initial_issue_comments = await issue_provider.fetch_comments(issue.slug)
+        initial_issue_comment_count = len(initial_issue_comments)
+    except Exception:
+        initial_issue_comment_count = 0
+
+    while True:
+        try:
+            event, comment = await _poll_for_event(
+                pr.number, initial_pr_count, initial_issue_comment_count,
+                issue, repo, issue_provider,
+            )
+        except asyncio.CancelledError as exc:
+            raise KeyboardInterrupt("Aborted by user") from exc
+
+        if event == PrPollResult.MERGED:
+            state.status = PipelineStatus.MERGED
+            console.print(f"[bold green]{issue.display_id}[/] PR merged!")
+            return state
+
+        # USER_COMMENT — apply user feedback with fresh coder context
+        console.print(
+            f"[bold cyan]{issue.display_id}[/] New user comment detected, applying feedback..."
+        )
+        state.status = PipelineStatus.IMPLEMENTING
+        result = await agent.apply_feedback(
+            comment,
+            worktree.path,
+            session_id=None,  # fresh context per user requirement
+            timeout=config.agent_timeout,
+            label=agent_label,
+        )
+
+        if not result.success:
+            state.status = PipelineStatus.FAILED
+            state.error = f"Coder agent failed on user comment: {result.error}"
+            console.print(f"[bold red]{issue.display_id}[/] {state.error}")
+            return state
+
+        # Review loop — reviewer keeps its accumulated session context
+        approved = False
+        last_feedback = ""
+        for round_num in range(1, config.max_review_rounds + 1):
+            await _git_sync(worktree)
+
+            state.status = PipelineStatus.REVIEWING
+            state.current_round = round_num
+            reviewer_label = f"{issue.display_id} PR#{pr.number} [reviewer/{config.reviewer_backend.value}]"
+            console.print(
+                f"[bold blue]{issue.display_id}[/] Post-comment review round "
+                f"{round_num}/{config.max_review_rounds}..."
+            )
+
+            review = await reviewer.review(
+                pr,
+                worktree.path,
+                timeout=config.agent_timeout,
+                label=reviewer_label,
+                round_number=round_num,
+                previous_feedback=last_feedback,
+            )
+            state.review_history.append(review)
+
+            if review.verdict == ReviewVerdict.APPROVED:
+                state.status = PipelineStatus.APPROVED
+                console.print(f"[bold green]{issue.display_id}[/] Approved after user comment!")
+                approved = True
+                break
+
+            if review.verdict == ReviewVerdict.ERROR:
+                state.status = PipelineStatus.FAILED
+                state.error = f"Reviewer error: {review.comments}"
+                console.print(f"[bold red]{issue.display_id}[/] {state.error}")
+                return state
+
+            # CHANGES_REQUESTED — coder applies reviewer feedback (fresh context)
+            last_feedback = review.comments
+            console.print(
+                f"[bold yellow]{issue.display_id}[/] Changes requested, applying reviewer feedback..."
+            )
+            state.status = PipelineStatus.IMPLEMENTING
+            result = await agent.apply_feedback(
+                review.comments,
+                worktree.path,
+                session_id=None,  # fresh context
+                timeout=config.agent_timeout,
+                label=agent_label,
+            )
+
+            if not result.success:
+                state.status = PipelineStatus.FAILED
+                state.error = f"Coder agent failed on reviewer feedback: {result.error}"
+                console.print(f"[bold red]{issue.display_id}[/] {state.error}")
+                return state
+
+        if not approved:
+            console.print(
+                f"[bold yellow]{issue.display_id}[/] Exhausted review rounds after user comment, "
+                f"resuming polling..."
+            )
+            state.status = PipelineStatus.APPROVED
+
+        # Re-snapshot counts before resuming polling
+        initial_pr_count = await repo.count_pr_interactions(pr.number)
+        try:
+            refreshed_comments = await issue_provider.fetch_comments(issue.slug)
+            initial_issue_comment_count = len(refreshed_comments)
+        except Exception:
+            pass
+
+        # Resume polling for merge or more user comments
+        console.print(
+            f"[bold yellow]{issue.display_id}[/] Waiting for merge or user comments on PR/issue...\n"
+            f"  {pr.url}\n"
+        )
+        console.print(f"[dim]Polling every {_POLL_INTERVAL}s until PR #{pr.number} is merged or commented...[/]")
+
+
+async def run_pipeline(
+    issue: Issue,
+    config: CorbitConfig,
+    repo: RepoProvider,
+    issue_provider: IssueProvider,
+) -> PipelineState:
     """Execute the full pipeline for a single issue."""
     state = PipelineState(issue_slug=issue.slug, source=issue.source)
     agent = get_agent(config.coder_backend, model=config.coder_model, skip_permissions=config.skip_permissions)
-    reviewer = Reviewer(backend=config.reviewer_backend, model=config.reviewer_model, skip_permissions=config.skip_permissions)
+    reviewer = Reviewer(repo=repo, backend=config.reviewer_backend, model=config.reviewer_model, skip_permissions=config.skip_permissions)
 
     try:
         console.print(f"[bold blue]{issue.display_id}[/] {issue.title}")
@@ -204,7 +390,7 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
         saved_step = str(saved.get("step", ""))
 
         # 2. Implementation + push + PR (skip if already done)
-        pr = await find_pr_for_branch(worktree.branch_name)
+        pr = await repo.find_pr_for_branch(worktree.branch_name)
         if pr is not None and saved_step in ("implemented", "reviewed", "feedback_applied"):
             agent_label = f"{issue.display_id} PR#{pr.number} [coder/{config.coder_backend.value}]"
             console.print(
@@ -252,10 +438,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 state.status = PipelineStatus.FAILED
                 state.error = f"Coder agent failed: {result.error}"
                 console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                await _maybe_post_linear_comment(
+                await _maybe_post_issue_comment(
                     issue,
                     f"❌ Pipeline failed: {state.error}",
                     config,
+                    issue_provider,
                 )
                 return state
 
@@ -271,11 +458,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
 
             # Discover the PR the agent created (before rebase so we can
             # save state and allow resumption if rebase fails).
-            pr = await find_pr_for_branch(worktree.branch_name)
+            pr = await repo.find_pr_for_branch(worktree.branch_name)
             if pr is None:
                 # Agent didn't create a PR — fall back to creating one ourselves
                 console.print(f"[bold yellow]{agent_label}[/] Agent didn't create a PR, creating...")
-                await push_branch(worktree.branch_name, str(worktree.path))
+                await repo.push_branch(worktree.branch_name, str(worktree.path))
                 if issue.source == IssueSource.GITHUB:
                     pr_body = (
                         f"Closes #{issue.slug}\n\n"
@@ -286,9 +473,9 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                         f"Implements {issue.url}\n\n"
                         f"Automated implementation by Corbit using `{config.coder_backend.value}`."
                     )
-                pr = await create_pull_request(
-                    head_branch=worktree.branch_name,
-                    base_branch=worktree.base_branch,
+                pr = await repo.create_pull_request(
+                    head=worktree.branch_name,
+                    base=worktree.base_branch,
                     title=f"fix: resolve {issue.display_id} — {issue.title}",
                     body=pr_body,
                 )
@@ -302,10 +489,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 pr_number=pr.number,
                 pr_url=pr.url,
             )
-            await _maybe_post_linear_comment(
+            await _maybe_post_issue_comment(
                 issue,
                 f"🤖 PR created by Corbit: {pr.url}",
                 config,
+                issue_provider,
             )
 
             # Rebase onto latest base branch so the PR stays mergeable
@@ -316,7 +504,7 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 state.status = PipelineStatus.FAILED
                 state.error = str(exc)
                 console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                await _maybe_post_linear_comment(issue, f"❌ Pipeline failed: {state.error}", config)
+                await _maybe_post_issue_comment(issue, f"❌ Pipeline failed: {state.error}", config, issue_provider)
                 return state
 
         # 3. Review loop (skip if single-pass)
@@ -325,6 +513,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
             console.print(
                 f"[bold green]{issue.display_id}[/] Single-pass mode — skipping review"
             )
+            if config.merge_strategy == MergeStrategy.WAIT:
+                return await _wait_and_react(
+                    state, issue, config, agent, reviewer, pr, worktree, agent_label,
+                    repo, issue_provider,
+                )
             return state
 
         # Determine where to resume in the review loop
@@ -349,10 +542,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 console.print(
                     f"[bold yellow]{issue.display_id}[/] Applying saved review feedback..."
                 )
-                await _maybe_post_linear_comment(
+                await _maybe_post_issue_comment(
                     issue,
                     f"🔧 Applying review feedback (round {round_num})...",
                     config,
+                    issue_provider,
                 )
                 state.status = PipelineStatus.IMPLEMENTING
                 result = await agent.apply_feedback(
@@ -367,10 +561,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                     state.status = PipelineStatus.FAILED
                     state.error = f"Coder agent failed on feedback: {result.error}"
                     console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                    await _maybe_post_linear_comment(
+                    await _maybe_post_issue_comment(
                         issue,
                         f"❌ Pipeline failed: {state.error}",
                         config,
+                        issue_provider,
                     )
                     return state
 
@@ -426,21 +621,28 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
             if review.verdict == ReviewVerdict.APPROVED:
                 state.status = PipelineStatus.APPROVED
                 console.print(f"[bold green]{issue.display_id}[/] Approved!")
-                await _maybe_post_linear_comment(
+                await _maybe_post_issue_comment(
                     issue,
                     f"✅ Implementation approved after {round_num} review round(s). PR: {pr.url}",
                     config,
+                    issue_provider,
                 )
+                if config.merge_strategy == MergeStrategy.WAIT:
+                    return await _wait_and_react(
+                        state, issue, config, agent, reviewer, pr, worktree, agent_label,
+                        repo, issue_provider,
+                    )
                 return state
 
             if review.verdict == ReviewVerdict.ERROR:
                 state.status = PipelineStatus.FAILED
                 state.error = f"Reviewer error: {review.comments}"
                 console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                await _maybe_post_linear_comment(
+                await _maybe_post_issue_comment(
                     issue,
                     f"❌ Pipeline failed: {state.error}",
                     config,
+                    issue_provider,
                 )
                 return state
 
@@ -455,7 +657,7 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 )
             else:
                 round_comment = f"🔍 Review round {round_num}: changes requested"
-            await _maybe_post_linear_comment(issue, round_comment, config)
+            await _maybe_post_issue_comment(issue, round_comment, config, issue_provider)
 
             last_review_comments = review.comments
 
@@ -477,10 +679,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
             console.print(
                 f"[bold yellow]{issue.display_id}[/] Changes requested, applying feedback..."
             )
-            await _maybe_post_linear_comment(
+            await _maybe_post_issue_comment(
                 issue,
                 f"🔧 Applying review feedback (round {round_num})...",
                 config,
+                issue_provider,
             )
             state.status = PipelineStatus.IMPLEMENTING
             result = await agent.apply_feedback(
@@ -495,10 +698,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
                 state.status = PipelineStatus.FAILED
                 state.error = f"Coder agent failed on feedback: {result.error}"
                 console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-                await _maybe_post_linear_comment(
+                await _maybe_post_issue_comment(
                     issue,
                     f"❌ Pipeline failed: {state.error}",
                     config,
+                    issue_provider,
                 )
                 return state
 
@@ -517,10 +721,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
         state.status = PipelineStatus.FAILED
         state.error = f"Exhausted {config.max_review_rounds} review rounds without approval"
         console.print(f"[bold red]{issue.display_id}[/] {state.error}")
-        await _maybe_post_linear_comment(
+        await _maybe_post_issue_comment(
             issue,
             f"❌ Pipeline failed: {state.error}",
             config,
+            issue_provider,
         )
 
     except KeyboardInterrupt:
@@ -533,10 +738,11 @@ async def run_pipeline(issue: Issue, config: CorbitConfig) -> PipelineState:
         state.status = PipelineStatus.FAILED
         state.error = str(exc)
         console.print(f"[bold red]{issue.display_id}[/] Error: {exc}")
-        await _maybe_post_linear_comment(
+        await _maybe_post_issue_comment(
             issue,
             f"❌ Pipeline failed: {exc}",
             config,
+            issue_provider,
         )
 
     finally:

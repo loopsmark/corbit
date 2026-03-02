@@ -11,8 +11,8 @@ from pathlib import Path
 
 from rich.console import Console
 
-from corbit.github import post_pr_review
 from corbit.models import AgentBackend, PullRequestInfo, ReviewItem, ReviewResult, ReviewSeverity, ReviewVerdict
+from corbit.repo.base import RepoProvider
 from corbit.prompts import build_review_prompt
 from corbit.stream import run_streaming
 
@@ -83,10 +83,12 @@ class Reviewer:
 
     def __init__(
         self,
+        repo: RepoProvider,
         backend: AgentBackend = AgentBackend.CLAUDE_CODE,
         model: str = "",
         skip_permissions: bool = True,
     ) -> None:
+        self._repo = repo
         self._backend = backend
         self._model = model
         self._skip_permissions = skip_permissions
@@ -167,7 +169,7 @@ class Reviewer:
             else:
                 body = review.comments or ("LGTM" if review.verdict == ReviewVerdict.APPROVED else "")
             try:
-                await post_pr_review(pr.number, review.verdict.value, body)
+                await self._repo.post_review(pr.number, review.verdict.value, body)
             except RuntimeError as exc:
                 _console.print(f"[yellow]Warning: failed to post review to GitHub: {exc}[/]")
 
@@ -340,19 +342,27 @@ class Reviewer:
                     severity=severity,
                 ))
 
-        # Build feedback for the coder from all items
-        if items:
+        # Build feedback for the coder from blocking items only (exclude nits)
+        blocking_items = [item for item in items if item.severity != ReviewSeverity.NIT]
+        if blocking_items:
             comments = "\n".join(
                 f"- [{item.severity.value}] {item.file}: {item.comment}"
-                for item in items
+                for item in blocking_items
             )
+        elif items:
+            # All items are nits — no actionable feedback
+            comments = ""
         else:
             comments = data.get("comments", "")
 
+        # If the only items are nits, treat as approved
+        if verdict == ReviewVerdict.CHANGES_REQUESTED and items and not blocking_items:
+            verdict = ReviewVerdict.APPROVED
+
         # Guard against inconsistent LLM output: if the verdict is
-        # "approved" but there are items, override to "changes-requested"
+        # "approved" but there are blocking items, override to "changes-requested"
         # so we never approve and simultaneously request work.
-        if verdict == ReviewVerdict.APPROVED and items:
+        if verdict == ReviewVerdict.APPROVED and blocking_items:
             verdict = ReviewVerdict.CHANGES_REQUESTED
 
         return ReviewResult(
