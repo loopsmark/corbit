@@ -54,7 +54,7 @@ _SEVERITY_HEADERS: dict[ReviewSeverity, str] = {
     ReviewSeverity.CORRECTNESS: "Correctness",
     ReviewSeverity.DESIGN: "Design",
     ReviewSeverity.TESTING: "Testing",
-    ReviewSeverity.NIT: "Nits (informational)",
+    ReviewSeverity.NIT: "Nits",
 }
 
 
@@ -342,27 +342,20 @@ class Reviewer:
                     severity=severity,
                 ))
 
-        # Build feedback for the coder from blocking items only (exclude nits)
-        blocking_items = [item for item in items if item.severity != ReviewSeverity.NIT]
-        if blocking_items:
+        # Build feedback for the coder from all items (nits included —
+        # every finding must be resolved before approval).
+        if items:
             comments = "\n".join(
                 f"- [{item.severity.value}] {item.file}: {item.comment}"
-                for item in blocking_items
+                for item in items
             )
-        elif items:
-            # All items are nits — no actionable feedback
-            comments = ""
         else:
             comments = data.get("comments", "")
 
-        # If the only items are nits, treat as approved
-        if verdict == ReviewVerdict.CHANGES_REQUESTED and items and not blocking_items:
-            verdict = ReviewVerdict.APPROVED
-
         # Guard against inconsistent LLM output: if the verdict is
-        # "approved" but there are blocking items, override to "changes-requested"
+        # "approved" but there are items, override to "changes-requested"
         # so we never approve and simultaneously request work.
-        if verdict == ReviewVerdict.APPROVED and blocking_items:
+        if verdict == ReviewVerdict.APPROVED and items:
             verdict = ReviewVerdict.CHANGES_REQUESTED
 
         return ReviewResult(
